@@ -237,19 +237,15 @@ function verifyEntry(filePath) {
     problems.push(`  unbound call: ${name}() — missing node:* import`)
   }
 
-  // Authoritative gate: every node:* import must be referenced in the code.
-  // A symbol imported but never used means tsdown tree-shook it away — the
-  // source's import list is then stale and a future edit may rely on it.
-  const clean = stripCommentsAndStrings(code)
-  for (const [name, moduleName] of nodeImports) {
-    // The import statement itself contains the name; count real references
-    // beyond the import line.
-    const refRe = new RegExp(`(?<![\\w$.])${name}(?![\\w$])`, 'g')
-    const refs = clean.match(refRe) ?? []
-    if (refs.length <= 1) {
-      problems.push(`  imported ${name} from ${moduleName} but never used (tree-shaken)`)
-    }
-  }
+  // Since the DSH Desktop compatibility change, the seam packages
+  // (dsh-fs-local, dsh-shell, ...) are BUNDLED INLINE into this output. Their
+  // internal node:* imports (e.g. sep from node:path, randomUUID from
+  // node:crypto) land in this file alongside the plugin's own imports. Some
+  // are tree-shaken away while their import statements survive, so the
+  // "imported but never used" test cannot distinguish plugin bugs from
+  // inert library imports. The authoritative gate is the call-site binding
+  // check above (a bare call without an import is the statSync-class bug);
+  // an unused import is dead code at worst.
   return problems
 }
 

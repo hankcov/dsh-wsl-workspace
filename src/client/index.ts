@@ -30,6 +30,9 @@ export const inject = ['slots', 'locale', 'connection', 'sessions', 'workspaces'
 /** The legacy standalone WSL preset id (folded into the mode variants). */
 const LEGACY_WSL_PRESET_ID = 'wsl'
 
+/** The WSL mode variant to auto-bind new sessions to. */
+const WSL_VARIANT = 'wsl-standard'
+
 /**
  * Minimal sessions-service face. The renderer-host ctx merge types
  * `ctx.sessions` as its own SessionStore; the service the runtime actually
@@ -41,13 +44,54 @@ interface WslSessionsFace {
     getSnapshot(): { ids: string[]; byId: Record<string, { blank: boolean; cwd?: string; agentPreset?: string }> }
     subscribe(fn: () => void): () => void
   }
-  noteAgentPreset(sessionId: string, agentPreset: string): void
+  /** Web-only: note the preset locally after a successful select; absent on Desktop. */
+  noteAgentPreset?(sessionId: string, agentPreset: string): void
+  create(opts: { workspaceId: string }): Promise<string>
+  open(sessionId: string): void
 }
 
-/** Minimal workspaces-service face (create + start-session only). */
+/** Minimal workspaces-service face (create only). */
 interface WslWorkspacesFace {
   create(input: { path: string }): Promise<{ workspaceId: string }>
-  startSession(workspaceId?: string): void
+}
+
+/**
+ * Desktop 0.1.x internal SessionManager remote: the typet-based session.create
+ * RPC accepts an agentPreset field that the public sessions.create() wrapper
+ * does not forward.
+ */
+interface SessionCreatePayload {
+  workspaceId: string
+  sessionId?: string
+  agentPreset?: string
+}
+
+/** Type-et session.create result envelope. */
+interface SessionCreateResult {
+  ok: boolean
+  value?: { sessionId: string; agentPreset?: string }
+  error?: { code: string; message: string }
+}
+
+/** Internal SessionManager remote face. */
+interface SessionManagerRemote {
+  session: {
+    create(payload: SessionCreatePayload): Promise<SessionCreateResult>
+  }
+}
+
+/** Internal SessionManager face (accessed via sessions.manager). */
+interface SessionManager {
+  remote: SessionManagerRemote
+  recordMutation(mutation: { kind: string; summary: Record<string, unknown> }): void
+}
+
+/** Internal ClientSessions face (the sessions service cast). */
+interface ClientSessions {
+  manager: SessionManager
+  projectList(): void
+  list: { getSnapshot(): { ids: string[]; byId: Record<string, unknown> } }
+  open(id: string): void
 }
 
 /**
@@ -55,9 +99,15 @@ interface WslWorkspacesFace {
  * @param ctx - the browser plugin context.
  */
 export function apply(ctx: ClientContext): void {
-  const { api } = ctx.get('connection') as ConnectionHandle
+  const connection = ctx.get('connection') as ConnectionHandle & { rpc?: unknown }
+  const api = (connection as ConnectionHandle).api
   const workspaces = ctx.get('workspaces') as unknown as WslWorkspacesFace
-  const sessions = ctx.get('sessions') as unknown as WslSessionsFace
+  const sessions = ctx.get('sessions') as unknown as WslSessionsFace & ClientSessions
+
+  // Desktop 0.1.x: api is absent; use the internal typet remote to create
+  // sessions with agentPreset, since the public sessions.create() does not
+  // forward the field.
+  const hasApi = api !== undefined
 
   ensureStyles()
 
@@ -75,9 +125,42 @@ export function apply(ctx: ClientContext): void {
   // cwd is one of these binds to the WSL variant like a UNC-cwd session.
   let wslWindowsPaths = new Set<string>()
 
+  /** Create a session in a workspace, passing agentPreset through the internal
+   *  typet remote since the public sessions.create() API does not forward it. */
+  const createWslSession = async (workspaceId: string): Promise<string> => {
+    if (sessions.manager?.remote?.session?.create !== undefined) {
+      // Desktop 0.1.x: use the internal typet remote to pass agentPreset.
+      const result = await sessions.manager.remote.session.create({
+        workspaceId,
+        agentPreset: WSL_VARIANT,
+      })
+      if (result.ok && result.value !== undefined) {
+        const sessionId = result.value.sessionId
+        // Update the local list snapshot so the UI sees the new session
+        // immediately without waiting for the next refresh.
+        sessions.manager.recordMutation({
+          kind: 'upsert',
+          summary: {
+            sessionId,
+            updatedAt: Date.now(),
+            running: false,
+            blank: true,
+            agentPreset: WSL_VARIANT,
+          },
+        })
+        sessions.projectList()
+        return sessionId
+      }
+    }
+    // Fallback: use the public API (Web or Desktop without the internal remote).
+    const sessionId = await sessions.create({ workspaceId })
+    return sessionId
+  }
+
   const injected = (): AddWslWorkspaceInjected => ({
     t,
     checkPreset: async (): Promise<string | undefined> => {
+      if (!hasApi) return undefined
       let roster
       try {
         const response = await api.agentPresets.list({})
@@ -98,21 +181,19 @@ export function apply(ctx: ClientContext): void {
       try {
         const winPath = mntToWindowsPath(linuxPath)
         if (winPath !== null) {
-          // `/mnt/<drive>` workspace: the workspace registry realpath/stats
-          // the path and 9P cannot serve drvfs mounts, so register under the
-          // drive spelling and store distro/username for the session env.
-          // The browser binding below recognizes the drive cwd as WSL.
           const view = await workspaces.create({ path: winPath })
           await registerWindowsApi(linuxPath, distro, username)
           const canonical = canonicalWindowsPath(winPath)
           if (canonical !== null) wslWindowsPaths = new Set(wslWindowsPaths).add(canonical)
-          workspaces.startSession(view.workspaceId)
+          const sessionId = await createWslSession(view.workspaceId)
+          sessions.open(sessionId)
           return undefined
         }
         const uncPath = joinUnc(distro, linuxPath)
         const view = await workspaces.create({ path: uncPath })
         await setWorkspaceUserApi(uncPath, username)
-        workspaces.startSession(view.workspaceId)
+        const sessionId = await createWslSession(view.workspaceId)
+        sessions.open(sessionId)
         return undefined
       } catch (error) {
         return error instanceof Error ? error.message : String(error)
@@ -131,22 +212,22 @@ export function apply(ctx: ClientContext): void {
     'dsh-wsl-workspace: sidebar footer action',
   )
 
-  // Mode-variant binding: a blank session whose workspace is a WSL UNC path
-  // is recomposed to the WSL variant of the mode it currently runs — plain
-  // 标准 becomes `wsl-standard`, PTC becomes `wsl-code`, and so on — so the
-  // WSL execution world composes with ANY mode instead of replacing it. The
-  // host refuses non-blank sessions (agent-preset-locked), so the swap is
-  // attempted at most a few times per session.
+  // ---- Auto-binding effect ----
+  // Every blank session whose cwd is a WSL UNC path (or a registered
+  // /mnt/<drive> workspace) is bound to the WSL mode variant.  On Web the
+  // roster of available variants is refreshed periodically; on Desktop 0.1.x
+  // we bind directly to the fixed `wsl-standard` variant via the internal
+  // typet remote.
   ctx.effect(() => {
     const inFlight = new Set<string>()
     const attempts = new Map<string, number>()
     const MAX_ATTEMPTS = 3
-    // Healthy `wsl-<mode>` variant ids plus the roster's default preset id
-    // (what a session with no explicit choice gets). Refreshed periodically
-    // so variants generated after this page loaded are picked up.
+
+    // Web path: refresh the roster of available wsl-* variants.
     let variants = new Set<string>()
     let defaultPreset: string | undefined
     const refreshRoster = (): void => {
+      if (!hasApi) return
       void api.agentPresets.list({}).then((response: {
         result: { ok: boolean; value: { presets: { id: string; broken?: string; isDefault?: boolean }[] } }
       }) => {
@@ -159,12 +240,10 @@ export function apply(ctx: ClientContext): void {
         defaultPreset = result.value.presets.find(
           (entry: { id: string; isDefault?: boolean }) => entry.isDefault === true,
         )?.id
-      }).catch(() => {
-        // A failed roster read leaves the previous mapping; sessions stay on
-        // their current composition until the next refresh.
-      })
+      }).catch(() => { /* stale roster is acceptable */ })
     }
     refreshRoster()
+
     const refreshWorkspaces = (): void => {
       void listWorkspacesApi().then((keys: string[]) => {
         const next = new Set<string>()
@@ -173,57 +252,72 @@ export function apply(ctx: ClientContext): void {
           if (canonical !== null) next.add(canonical)
         }
         wslWindowsPaths = next
-      }).catch(() => {
-        // A failed store read leaves the previous set; sessions stay on
-        // their current composition until the next refresh.
-      })
+      }).catch(() => { /* stale set is acceptable */ })
     }
     refreshWorkspaces()
-    const maybeBind = (): void => {
+
+    // Bind one session to its WSL variant.  Returns the bound variant id,
+    // or undefined when binding is not possible.
+    const bindSession = async (id: string): Promise<string | undefined> => {
       const state = sessions.list.getSnapshot()
-      for (const id of state.ids) {
-        const summary = state.byId[id]
-        if (summary === undefined || !summary.blank || summary.cwd === undefined) continue
-        // A session belongs to the WSL world when its cwd is a WSL UNC path,
-        // or a Windows drive path registered as a `/mnt/<drive>` workspace
-        // (9P cannot serve drvfs, so those workspaces carry drive cwds).
-        const canonical = canonicalWindowsPath(summary.cwd)
-        const isWsl = isWslUnc(summary.cwd)
-          || (canonical !== null && wslWindowsPaths.has(canonical))
-        if (!isWsl) continue
-        const current = summary.agentPreset
-        if (current !== undefined && current.startsWith('wsl-')) continue
-        // Legacy standalone `wsl` (now folded into the variants): remap it to
-        // the default mode's variant, since the standalone preset no longer
-        // exists in the roster.
+      const summary = state.byId[id]
+      if (summary === undefined || !summary.blank || summary.cwd === undefined) return undefined
+      const canonical = canonicalWindowsPath(summary.cwd)
+      const isWsl = isWslUnc(summary.cwd)
+        || (canonical !== null && wslWindowsPaths.has(canonical))
+      if (!isWsl) return undefined
+      const current = summary.agentPreset
+      if (current !== undefined && current.startsWith('wsl-')) return undefined
+
+      if (hasApi) {
+        // Web: resolve the correct variant from the roster.
         const base = current === LEGACY_WSL_PRESET_ID
           ? (defaultPreset ?? 'standard')
           : (current ?? defaultPreset)
-        if (base === undefined || base === LEGACY_WSL_PRESET_ID || base.startsWith('wsl-')) continue
+        if (base === undefined || base === LEGACY_WSL_PRESET_ID || base.startsWith('wsl-')) return undefined
         const target = `wsl-${base.toLowerCase()}`
-        if (!variants.has(target)) continue
-        if (inFlight.has(id) || (attempts.get(id) ?? 0) >= MAX_ATTEMPTS) continue
+        if (!variants.has(target)) return undefined
         inFlight.add(id)
-        void api.agentPresets.select({ sessionId: id, agentPreset: target })
-          .then((response: { result: { ok: boolean } }) => {
-            if (response.result.ok) sessions.noteAgentPreset(id, target)
-          })
-          .catch(() => {
-            // A refused or aborted swap (session already produced output,
-            // roster churn, reconnect) leaves the session on its current
-            // composition; count the attempt so a stuck session stops
-            // retrying after MAX_ATTEMPTS.
-            attempts.set(id, (attempts.get(id) ?? 0) + 1)
-          })
-          .finally(() => {
-            inFlight.delete(id)
-          })
+        try {
+          const response = await api.agentPresets.select({ sessionId: id, agentPreset: target })
+          if (response.result.ok) {
+            sessions.noteAgentPreset?.(id, target)
+            return target
+          }
+        } catch { /* retry on next snapshot */ }
+        finally { inFlight.delete(id) }
+        return undefined
+      }
+
+      // Desktop 0.1.x: bind directly to the fixed WSL variant via the
+      // internal typet remote (avoids needing the non-existent
+      // agentPresets/select HTTP RPC endpoint).  Passing the existing
+      // sessionId to session.create applies the agentPreset on the host.
+      if (sessions.manager?.remote?.session?.create === undefined) return undefined
+      inFlight.add(id)
+      try {
+        await sessions.manager.remote.session.create({
+          workspaceId: '',
+          sessionId: id,
+          agentPreset: WSL_VARIANT,
+        } as unknown as SessionCreatePayload)
+        return WSL_VARIANT
+      } catch { /* retry on next snapshot */ }
+      finally { inFlight.delete(id) }
+      return undefined
+    }
+
+    const maybeBind = (): void => {
+      const state = sessions.list.getSnapshot()
+      for (const id of state.ids) {
+        if (inFlight.has(id) || (attempts.get(id) ?? 0) >= MAX_ATTEMPTS) continue
+        void bindSession(id).then((bound) => {
+          if (bound === undefined) attempts.set(id, (attempts.get(id) ?? 0) + 1)
+        })
       }
     }
     maybeBind()
     const unsubscribe = sessions.list.subscribe(() => maybeBind())
-    // Variants are generated at host boot; a page loaded before that would
-    // never see them without a periodic refresh.
     const timer = window.setInterval(refreshRoster, 60_000)
     return () => {
       unsubscribe()
